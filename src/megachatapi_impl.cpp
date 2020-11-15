@@ -2027,7 +2027,7 @@ void MegaChatApiImpl::sendPendingRequests()
                 if (res != 0)
                 {
                     request->setNumber(res);
-                    errorCode = MegaChatError::ERROR_NOENT;
+                    errorCode = MegaChatError::ERROR_TOOMANY;
                     break;
                 }
 
@@ -4804,7 +4804,8 @@ MegaHandleList* MegaChatApiImpl::getReactionUsers(MegaChatHandle chatid, MegaCha
 
     SdkMutexGuard g(sdkMutex);
     Message *msg = findMessage(chatid, msgid);
-    if (!msg)
+    ChatRoom *chatroom = findChatRoom(chatid);
+    if (!msg || !chatroom)
     {
         API_LOG_ERROR("Chatroom or message not found");
         return userList;
@@ -4812,6 +4813,7 @@ MegaHandleList* MegaChatApiImpl::getReactionUsers(MegaChatHandle chatid, MegaCha
 
     bool reacted = false;
     string reactionStr(reaction);
+    int pendingReactionStatus = chatroom->chat().getPendingReactionStatus(reactionStr, msgid);
     const std::vector<karere::Id> &users = msg->getReactionUsers(reactionStr);
     for (auto user: users)
     {
@@ -4821,18 +4823,21 @@ MegaHandleList* MegaChatApiImpl::getReactionUsers(MegaChatHandle chatid, MegaCha
         }
         else
         {
-            reacted = true;
+            if (pendingReactionStatus != OP_DELREACTION)
+            {
+                // if we have reacted and there's no a pending DELREACTION
+                reacted = true;
+                userList->addMegaHandle(mClient->myHandle());
+            }
         }
     }
 
-    ChatRoom *chatroom = findChatRoom(chatid);
-    int pendingReactionStatus = chatroom->chat().getPendingReactionStatus(reactionStr, msgid);
-    if ((reacted && pendingReactionStatus != OP_DELREACTION)
-        || (!reacted && pendingReactionStatus == OP_ADDREACTION))
+    if (!reacted && pendingReactionStatus == OP_ADDREACTION)
     {
-        // Own user only must be added to userlist after check pending reactions
+        // if we don't have reacted and there's a pending ADDREACTION
         userList->addMegaHandle(mClient->myHandle());
     }
+
     return userList;
 }
 
@@ -6055,6 +6060,11 @@ void MegaChatCallPrivate::setStatus(int status)
 
 void MegaChatCallPrivate::setLocalAudioVideoFlags(AvFlags localAVFlags)
 {
+    if (this->localAVFlags == localAVFlags)
+    {
+        return;
+    }
+
     this->localAVFlags = localAVFlags;
     changed |= MegaChatCall::CHANGE_TYPE_LOCAL_AVFLAGS;
 }
@@ -6366,7 +6376,7 @@ void MegaChatRoomHandler::fireOnChatRoomUpdate(MegaChatRoom *chat)
 
 void MegaChatRoomHandler::fireOnMessageLoaded(MegaChatMessage *msg)
 {
-    for(set<MegaChatRoomListener *>::iterator it = roomListeners.begin(); it != roomListeners.end() ; it++)
+    for(set<MegaChatRoomListener *>::iterator it = roomListeners.begin(); it != roomListeners.end(); it++)
     {
         (*it)->onMessageLoaded(chatApi, msg);
     }
@@ -8228,7 +8238,7 @@ bool MegaChatMessagePrivate::isDeleted() const
 
 bool MegaChatMessagePrivate::isEditable() const
 {
-    return ((type == TYPE_NORMAL || type == TYPE_CONTAINS_META) && !isDeleted() && ((time(NULL) - ts) < CHATD_MAX_EDIT_AGE));
+    return ((type == TYPE_NORMAL || type == TYPE_CONTAINS_META) && !isDeleted() && ((time(NULL) - ts) < CHATD_MAX_EDIT_AGE) && !isGiphy());
 }
 
 bool MegaChatMessagePrivate::isDeletable() const
@@ -8404,6 +8414,15 @@ int MegaChatMessagePrivate::getTermCode() const
     return code;
 }
 
+bool MegaChatMessagePrivate::isGiphy() const
+{
+    if (auto metaType = getContainsMeta())
+    {
+        return metaType->getType() == MegaChatContainsMeta::CONTAINS_META_GIPHY;
+    }
+    return false;
+}
+
 LoggerHandler::LoggerHandler()
     : ILoggerBackend(MegaChatApi::LOG_LEVEL_INFO)
 {
@@ -8520,9 +8539,10 @@ void MegaChatCallHandler::setCall(rtcModule::ICall *call)
                                  rtcModule::ICall::stateToStr(chatCall->getStatus()),
                                  rtcModule::ICall::stateToStr(call->state()));
             chatCall->setStatus(call->state());
-            megaChatApi->fireOnChatCallUpdate(chatCall);
         }
+
         chatCall->setLocalAudioVideoFlags(call->sentFlags());
+        megaChatApi->fireOnChatCallUpdate(chatCall);
         assert(chatCall->getId() == call->id());
     }
 }
